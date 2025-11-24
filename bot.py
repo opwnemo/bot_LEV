@@ -42,7 +42,7 @@ API_TOKEN = os.environ.get("API_TOKEN")
 if not API_TOKEN:
     raise ValueError("API_TOKEN is missing. Set it in environment variables!")
 
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "8086230570") or 0)
+ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 DB_FILE = os.environ.get("DB_FILE", "bot.db")
 CONSPECTS_DIR = os.environ.get("CONSPECTS_DIR", "conspects")
 os.makedirs(CONSPECTS_DIR, exist_ok=True)
@@ -870,3 +870,4 @@ async def on_startup(dispatcher):
 if __name__ == "__main__":
     print("Starting bot. Make sure API_TOKEN and ADMIN_ID are set in env.")
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+
