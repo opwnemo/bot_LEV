@@ -5,7 +5,7 @@
 ## 🚀 Установка
 
 ### 1. Клонирование проекта
-git clone https://github.com/USERNAME/REPO_NAME.git
+git clone https://github.com/opwnemo/bot_LEV.git
 cd REPO_NAME
 
 ### 2. Установка зависимостей
