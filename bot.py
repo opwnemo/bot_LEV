@@ -23,6 +23,13 @@ from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
+# --- mention helper ---
+def make_mention(user):
+    if user.username:
+        return f"<a href='tg://user?id={user.id}'>@{user.username}</a>"
+    return f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
+
+
 
 import pandas as pd
 from aiogram import Bot, Dispatcher, types
@@ -545,7 +552,7 @@ async def handle_text(message: types.Message):
         praise = get_praise(message.from_user.id, sub["section"], sub["topic_title"], "text")
         await message.answer(praise, reply_markup=make_main_kb(message.from_user.id==ADMIN_ID))
         try:
-            await bot.send_message(ADMIN_ID, f"✅ @{message.from_user.username or message.from_user.first_name} прислал {sub['type'].upper()}: {sub['section']} — {sub['topic_title']}\n{sub['content_summary']}")
+            await bot.send_message(ADMIN_ID, f"✅ {make_mention(message.from_user)} прислал {sub['type'].upper()}: {sub['section']} — {sub['topic_title']}\n{sub['content_summary']}")
         except Exception:
             pass
         return
@@ -565,7 +572,7 @@ async def handle_text(message: types.Message):
         praise = get_praise(message.from_user.id, sub["section"], sub["topic_title"], "text")
         await message.answer("Записал без выбора темы. В следующий раз выбери тему через меню.\n\n" + praise, reply_markup=make_main_kb(message.from_user.id==ADMIN_ID))
         try:
-            await bot.send_message(ADMIN_ID, f"✅ @{message.from_user.username or message.from_user.first_name} прислал {sub['type'].upper()} (без темы): {sub['content_summary']}")
+            await bot.send_message(ADMIN_ID, f"✅ {make_mention(message.from_user)} прислал {sub['type'].upper()} (без темы): {sub['content_summary']}")
         except Exception:
             pass
         return
@@ -610,7 +617,7 @@ async def handle_photo(message: types.Message):
         praise = get_praise(message.from_user.id, sub["section"], sub["topic_title"], "photo")
         await message.answer(praise, reply_markup=make_main_kb(message.from_user.id==ADMIN_ID))
         try:
-            await bot.send_message(ADMIN_ID, f"📸 @{message.from_user.username or message.from_user.first_name} прислал {sub['type'].upper()}: {sub['section']} — {sub['topic_title']} — {summary}")
+            await bot.send_message(ADMIN_ID, f"📸 {make_mention(message.from_user)} прислал {sub['type'].upper()}: {sub['section']} — {sub['topic_title']} — {summary}")
             await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
         except Exception:
             pass
@@ -1006,7 +1013,9 @@ async def on_startup(dispatcher):
 #- MAIN
 if __name__ == "__main__":
     print("Starting bot. Make sure API_TOKEN and ADMIN_ID are set in env.")
+
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+
 
 
 
