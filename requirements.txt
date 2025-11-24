@@ -1,6 +1,8 @@
 aiogram==2.25.1
 APScheduler==3.10.4
-pandas==2.2.2
-openpyxl==3.1.2
 python-dotenv==1.0.1
+openpyxl==3.1.2
+
 --only-binary=:all:
+numpy==1.26.4
+pandas==2.0.3
