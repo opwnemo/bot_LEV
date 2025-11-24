@@ -4,5 +4,5 @@ python-dotenv==1.0.1
 openpyxl==3.1.2
 
 --only-binary=:all:
-numpy==1.26.4
-pandas==2.0.3
+numpy==1.23.5
+pandas==1.5.3
