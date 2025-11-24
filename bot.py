@@ -1,20 +1,16 @@
-
+#!/usr/bin/env python3
 """
-Homework / Conspect Bot (stable single-file version)
+Homework / Conspect Bot (stable single-file version) — updated
 
-Features:
-- SQLite storage (users, submissions, miss_reasons)
-- Submit homework or conspect (text / photo / album)
-- Save conspects to disk under CONSPECTS_DIR/<user_id>/
-- Daily: at 23:55 admin receives Excel with all users' daily statuses (cumulative rows)
-- Daily: at 23:57 bot asks users who didn't submit that day the reason and stores it
-- Admin panel: export user, delete user (by id or username), send today's report immediately, reset all data
-- All handlers and DB calls protected; no nested handlers; proper async/await usage
+Fixes:
+- admin pending handling (no accidental reset)
+- robust delete_user_data() to remove DB records and files
+- improved Excel report styling (green Google Sheets style)
+- dotenv usage for secrets
 """
 import random
 import os
 import io
-import json
 import time
 import zipfile
 import logging
@@ -22,8 +18,9 @@ import shutil
 import sqlite3
 import asyncio
 import unicodedata
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import List, Dict, Any, Optional
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -34,6 +31,11 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+# for excel styling
+from openpyxl import load_workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("homework-bot")
 
@@ -42,16 +44,16 @@ API_TOKEN = os.environ.get("API_TOKEN")
 if not API_TOKEN:
     raise ValueError("API_TOKEN is missing. Set it in environment variables!")
 
-ADMIN_ID = int(os.environ.get("ADMIN_ID"))
-DB_FILE = os.environ.get("DB_FILE", "bot.db")
-CONSPECTS_DIR = os.environ.get("CONSPECTS_DIR", "conspects")
-os.makedirs(CONSPECTS_DIR, exist_ok=True)
+try:
+    ADMIN_ID = int(os.environ.get("ADMIN_ID") or 0)
+except Exception:
+    ADMIN_ID = 0
 
-# Basic validation
-if not API_TOKEN:
-    logger.warning("API_TOKEN is empty. Set API_TOKEN env var before running.")
-if ADMIN_ID == 0:
-    logger.warning("ADMIN_ID is 0 or not set. Set ADMIN_ID env var (your Telegram id).")
+CONSPECTS_DIR = r"C:\BOT\conspects"
+DB_FILE = r"C:\BOT\bot.db"
+
+
+os.makedirs(CONSPECTS_DIR, exist_ok=True)
 
 # ---------------- BOT / DISPATCHER / SCHEDULER ----------------
 bot = Bot(token=API_TOKEN)
@@ -175,7 +177,7 @@ def add_submission_obj(user: types.User, submission: dict):
     except Exception:
         logger.exception("add_submission_obj error")
 
-#FILE SAVE
+# FILE SAVE
 async def download_file_bytes(file_id: str) -> Optional[bytes]:
     try:
         f = await bot.get_file(file_id)
@@ -251,7 +253,7 @@ def admin_kb():
     kb.add(InlineKeyboardButton("Отмена", callback_data="cancel"))
     return kb
 
-#PRAISE
+# PRAISE
 generic_praise = ["Молодец, отличная работа!","Здорово, так держать!","Круто, ты справился!","Умница, ДЗ принято!"]
 context_praise_templates = ["Отлично поработал над «{topic}» — заметен прогресс!","Круто! Тема «{topic}» покоряется тебе всё лучше.","Хорошая работа по «{topic}» — продолжай в том же духе!"]
 photo_praise = ["Фото принято — выглядит аккуратно!","Классный снимок, спасибо!","Фото получено — спасибо за старание!"]
@@ -276,7 +278,7 @@ def get_praise(user_id: int, section: str, topic_title: str, content_type: str) 
     n = 2 if random.random() > 0.4 else 1
     return " ".join(messages[:n])
 
-#MAKING EXCEL
+# MAKING EXCEL
 def submissions_for_date(target_date: date) -> List[dict]:
     dstr = target_date.isoformat()
     try:
@@ -306,45 +308,94 @@ def submissions_for_date(target_date: date) -> List[dict]:
         logger.exception("submissions_for_date build error")
         return []
 
+def style_worksheet(ws):
+    header_fill = PatternFill(start_color="A7F3D0", end_color="A7F3D0", fill_type="solid")
+    thin = Side(border_style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # header row styling
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = Font(bold=True)
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # apply border to body and compute column widths
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.border = border
+            # align text for cells with longer content
+            if cell.row > 1:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # auto width
+    for i, col in enumerate(ws.columns, 1):
+        max_length = 0
+        col_letter = get_column_letter(i)
+        for cell in col:
+            try:
+                if cell.value is not None:
+                    length = len(str(cell.value))
+                    if length > max_length:
+                        max_length = length
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_length + 5, 60)
+
 def make_daily_excel(target_date: date) -> io.BytesIO:
+    # build summary rows
     rows = submissions_for_date(target_date)
     df_summary = pd.DataFrame(rows)
+
+    # build raw submissions
     try:
         cursor.execute('''
-            SELECT s.user_id, u.username, u.first_name, s.type, s.section, s.topic_id, s.topic_title, s.content_type, s.content_summary, s.photo_file_id, s.date, s.ts
+            SELECT s.id, s.user_id, u.username, u.first_name, s.type, s.section, s.topic_id, s.topic_title, s.content_type, s.content_summary, s.photo_file_id, s.date, s.ts
             FROM submissions s JOIN users u ON s.user_id = u.id
             WHERE s.date = ?
             ORDER BY s.ts
         ''', (target_date.isoformat(),))
         raw = cursor.fetchall()
         raw_rows = [{
-            "user_id": r[0],
-            "username": r[1] or r[2],
-            "type": r[3],
-            "section": r[4],
-            "topic_id": r[5],
-            "topic_title": r[6],
-            "content_type": r[7],
-            "content_summary": r[8],
-            "photo_file_id": r[9],
-            "date": r[10],
-            "ts": r[11]
+            "id": r[0],
+            "user_id": r[1],
+            "username": r[2] or r[3],
+            "type": r[4],
+            "section": r[5],
+            "topic_id": r[6],
+            "topic_title": r[7],
+            "content_type": r[8],
+            "content_summary": r[9],
+            "photo_file_id": r[10],
+            "date": r[11],
+            "ts": r[12]
         } for r in raw]
         df_raw = pd.DataFrame(raw_rows)
     except Exception:
         logger.exception("make_daily_excel raw fetch error")
-        df_raw = pd.DataFrame(columns=["user_id","username","type","section","topic_id","topic_title","content_type","content_summary","photo_file_id","date","ts"])
+        df_raw = pd.DataFrame(columns=["id","user_id","username","type","section","topic_id","topic_title","content_type","content_summary","photo_file_id","date","ts"])
 
     bio = io.BytesIO()
+    # use pandas writer then style with openpyxl
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         if df_summary.empty:
             df_summary = pd.DataFrame(columns=["user_id","username","date","dz_submitted","conspect_submitted","miss_reason"])
         df_summary.to_excel(writer, sheet_name="daily_summary", index=False)
         if df_raw.empty:
-            df_raw = pd.DataFrame(columns=["user_id","username","type","section","topic_id","topic_title","content_type","content_summary","photo_file_id","date","ts"])
+            df_raw = pd.DataFrame(columns=["id","user_id","username","type","section","topic_id","topic_title","content_type","content_summary","photo_file_id","date","ts"])
         df_raw.to_excel(writer, sheet_name="raw_submissions", index=False)
     bio.seek(0)
-    return bio
+
+    # open with openpyxl and style
+    wb = load_workbook(filename=io.BytesIO(bio.read()))
+    if "daily_summary" in wb.sheetnames:
+        style_worksheet(wb["daily_summary"])
+    if "raw_submissions" in wb.sheetnames:
+        style_worksheet(wb["raw_submissions"])
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
 
 async def send_daily_excel_to_admin(target_date: date):
     try:
@@ -359,7 +410,7 @@ async def send_daily_excel_to_admin(target_date: date):
         except Exception:
             pass
 
-#HANDLERS
+# HANDLERS
 @dp.message_handler(commands=["start", "menu"])
 async def cmd_start(message: types.Message):
     ensure_user_record_obj(message.from_user)
@@ -394,6 +445,10 @@ async def cmd_my_conspects(message: types.Message):
 
 @dp.message_handler(lambda m: m.text == "📌 Главное меню")
 async def cmd_main_menu(message: types.Message):
+    uid = str(message.from_user.id)
+    # НЕ трогаем admin_pending!
+    if uid in pending:
+        pending.pop(uid)
     is_admin = (message.from_user.id == ADMIN_ID)
     await message.answer("Главное меню:", reply_markup=make_main_kb(is_admin))
 
@@ -453,14 +508,13 @@ async def handle_text(message: types.Message):
     uid = str(message.from_user.id)
     text = message.text.strip()
 
-
     if message.text in ("📊 Статистика",):
         return
 
-
+    # don't accidentally wipe admin_pending by generic commands
     if message.text in ("📚 Сдать ДЗ", "📘 Сдать конспект", "📁 Мои конспекты", "📌 Главное меню"):
-        pending.pop(uid, None)
-
+        if uid in pending:
+            pending.pop(uid)
 
     if uid in reasons_pending:
         miss_date = reasons_pending.pop(uid)
@@ -476,7 +530,6 @@ async def handle_text(message: types.Message):
     if str(message.from_user.id) in admin_pending:
         # handled by admin_pending_text callback
         return
-
 
     if uid in pending and "section" in pending[uid] and "topic" in pending[uid]:
         p = pending.pop(uid)
@@ -496,7 +549,6 @@ async def handle_text(message: types.Message):
         except Exception:
             pass
         return
-
 
     low = text.lower()
     if low.startswith("дз") or low.startswith("конспект"):
@@ -519,6 +571,7 @@ async def handle_text(message: types.Message):
         return
 
     await message.answer("Чтобы сдать ДЗ или конспект: нажми соответствующую кнопку в меню и выбери тему.", reply_markup=make_main_kb(message.from_user.id==ADMIN_ID))
+
 @dp.message_handler(content_types=types.ContentType.PHOTO)
 async def handle_photo(message: types.Message):
     uid = str(message.from_user.id)
@@ -682,7 +735,7 @@ async def produce_and_send_user_export(admin_id: int, identifier: str):
     excel_bio.seek(0)
     await bot.send_document(admin_id, InputFile(excel_bio, filename=f"user_{target_uid}_submissions.xlsx"))
 
-    # prepare zip of saved files
+    # prepare zip of saved files and download photos referenced in submissions
     zip_bio = io.BytesIO()
     with zipfile.ZipFile(zip_bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         user_dir = os.path.join(CONSPECTS_DIR, target_uid)
@@ -692,7 +745,6 @@ async def produce_and_send_user_export(admin_id: int, identifier: str):
                     full = os.path.join(root, f)
                     arc = os.path.relpath(full, user_dir)
                     zf.write(full, arc)
-        # download photos referenced in submissions
         for s in subs:
             pf = s[6]
             if pf:
@@ -709,39 +761,124 @@ async def produce_and_send_user_export(admin_id: int, identifier: str):
     else:
         await bot.send_message(admin_id, "У пользователя нет загруженных файлов/фото.")
 
+def delete_user_data(user_id: int):
+    # Remove all user's submissions/miss_reasons DB records and delete filesystem folders/files.
+    # Returns a dict with details for admin feedback and logging.
+    result = {
+        "db_deleted_submissions": 0,
+        "db_deleted_reasons": 0,
+        "db_before_submissions": None,
+        "db_after_submissions": None,
+        "db_before_reasons": None,
+        "db_after_reasons": None,
+        "files_removed": [],
+        "files_failed": [],
+        "errors": []
+    }
+
+    # 1) Database cleanup with counts before/after
+    try:
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM submissions WHERE user_id = ?", (int(user_id),))
+        result["db_before_submissions"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM miss_reasons WHERE user_id = ?", (int(user_id),))
+        result["db_before_reasons"] = cur.fetchone()[0]
+
+        cur.execute("DELETE FROM submissions WHERE user_id = ?", (int(user_id),))
+        cur.execute("DELETE FROM miss_reasons WHERE user_id = ?", (int(user_id),))
+        con.commit()
+
+        cur.execute("SELECT COUNT(*) FROM submissions WHERE user_id = ?", (int(user_id),))
+        result["db_after_submissions"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM miss_reasons WHERE user_id = ?", (int(user_id),))
+        result["db_after_reasons"] = cur.fetchone()[0]
+
+        result["db_deleted_submissions"] = (result["db_before_submissions"] or 0) - (result["db_after_submissions"] or 0)
+        result["db_deleted_reasons"] = (result["db_before_reasons"] or 0) - (result["db_after_reasons"] or 0)
+        con.close()
+    except Exception as e:
+        logger.exception("Error deleting DB records for user %s: %s", user_id, e)
+        result["errors"].append(f"db_error: {str(e)}")
+
+    # 2) Filesystem cleanup: remove CONSPECTS_DIR/<user_id> thoroughly
+    user_folder = os.path.join(CONSPECTS_DIR, str(user_id))
+    if os.path.exists(user_folder):
+        for root, dirs, files in os.walk(user_folder, topdown=False):
+            for name in files:
+                fpath = os.path.join(root, name)
+                try:
+                    os.remove(fpath)
+                    result["files_removed"].append(os.path.relpath(fpath, user_folder))
+                except Exception as e:
+                    logger.exception("Failed to remove file %s: %s", fpath, e)
+                    result["files_failed"].append({"path": fpath, "error": str(e)})
+            for name in dirs:
+                dpath = os.path.join(root, name)
+                try:
+                    os.rmdir(dpath)
+                except Exception:
+                    # ignore; final rmtree will handle nested content
+                    pass
+        try:
+            os.rmdir(user_folder)
+        except Exception:
+            try:
+                shutil.rmtree(user_folder)
+            except Exception as e:
+                logger.exception("Failed to remove user folder %s: %s", user_folder, e)
+                result["errors"].append(f"folder_rmtree_error: {str(e)}")
+    return result
+
 async def delete_user_submissions(admin_id: int, identifier: str):
     identifier = (identifier or "").lstrip('@').strip()
     target_uid = None
-    if identifier.isdigit():
-        cursor.execute('SELECT id FROM users WHERE id = ?', (int(identifier),))
-        if cursor.fetchone():
-            target_uid = str(identifier)
-    if not target_uid:
-        cursor.execute('SELECT id FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(first_name) = LOWER(?)', (identifier, identifier))
-        r = cursor.fetchone()
-        if r:
-            target_uid = str(r[0])
-    if not target_uid:
-        await bot.send_message(admin_id, "Пользователь не найден.")
-        return
-
     try:
-        cursor.execute('DELETE FROM submissions WHERE user_id = ?', (int(target_uid),))
-        cursor.execute('DELETE FROM miss_reasons WHERE user_id = ?', (int(target_uid),))
-        conn.commit()
-    except Exception:
-        logger.exception("delete_user_submissions DB error")
-        await bot.send_message(admin_id, "Ошибка при удалении из БД.")
-        return
+        if identifier.isdigit():
+            cursor.execute('SELECT id, username, first_name FROM users WHERE id = ?', (int(identifier),))
+            r = cursor.fetchone()
+            if r:
+                target_uid = str(r[0])
+        if not target_uid:
+            cursor.execute('SELECT id, username, first_name FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(first_name) = LOWER(?)', (identifier, identifier))
+            r = cursor.fetchone()
+            if r:
+                target_uid = str(r[0])
 
-    user_dir = os.path.join(CONSPECTS_DIR, target_uid)
-    if os.path.exists(user_dir):
+        if not target_uid:
+            await bot.send_message(admin_id, "Пользователь не найден.")
+            return
+
+        await bot.send_message(admin_id, f"Начинаю удаление данных пользователя {target_uid} ...")
+
+        res = delete_user_data(int(target_uid))
+
+        # Compose human-readable report for admin
+        parts = []
+        if res.get("errors"):
+            parts.append("В процессе удаления возникли ошибки:")
+            parts.extend(res["errors"])
+        else:
+            parts.append(f"Удаление завершено для пользователя {target_uid}.")
+            parts.append(f"Удалено записей submissions: {res.get('db_deleted_submissions',0)} (до={res.get('db_before_submissions')}, после={res.get('db_after_submissions')})")
+            parts.append(f"Удалено записей miss_reasons: {res.get('db_deleted_reasons',0)} (до={res.get('db_before_reasons')}, после={res.get('db_after_reasons')})")
+            if res.get("files_removed"):
+                sample = ", ".join(res["files_removed"][:8])
+                parts.append(f"Удалено файлов: {len(res['files_removed'])}. Примеры: {sample}")
+            else:
+                parts.append("Файлы не найдены или уже удалены.")
+            if res.get("files_failed"):
+                parts.append(f"Не удалось удалить {len(res['files_failed'])} файлов. Проверь логи сервера.")
+
+        text = "\\n".join(parts)
+        for chunk in [text[i:i+3900] for i in range(0, len(text), 3900)]:
+            await bot.send_message(admin_id, chunk)
+    except Exception as e:
+        logger.exception("delete_user_submissions error: %s", e)
         try:
-            shutil.rmtree(user_dir)
+            await bot.send_message(admin_id, "Ошибка при удалении данных пользователя. Смотри логи на сервере.")
         except Exception:
-            logger.exception("Failed to remove user dir")
-
-    await bot.send_message(admin_id, f"Отправления пользователя {target_uid} удалены (файлы на диске удалены).")
+            pass
 
 # ADMIN HANDLERS (callbacks & pending)
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("admin|"))
@@ -870,4 +1007,6 @@ async def on_startup(dispatcher):
 if __name__ == "__main__":
     print("Starting bot. Make sure API_TOKEN and ADMIN_ID are set in env.")
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+
+
 
