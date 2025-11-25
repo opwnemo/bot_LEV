@@ -37,6 +37,16 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("homework-bot")
 
+# additional imports for Excel styling and reports
+from openpyxl import load_workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
+# Reports directory
+REPORTS_DIR = os.environ.get('REPORTS_DIR', 'reports')
+os.makedirs(REPORTS_DIR, exist_ok=True)
+
+
 # ---------------- CONFIG ----------------
 API_TOKEN = os.environ.get("API_TOKEN")
 if not API_TOKEN:
@@ -65,6 +75,11 @@ media_groups: Dict[str, Dict[str, Any]] = {}     # key = f"{uid}|{mgid}"
 reasons_pending: Dict[str, str] = {}             # uid -> date_str (awaiting a reason reply)
 
 # ---------------- UTIL ----------------
+# --- mention helper (HTML clickable, no garbage) ---
+def mention_html(user):
+    name = (user.username and f"@{user.username}") or (user.first_name or f"user_{user.id}")
+    return f"<a href='tg://user?id={user.id}'>{name}</a>"
+
 def today_str() -> str:
     return date.today().isoformat()
 
@@ -244,6 +259,8 @@ def topics_keyboard(section_name):
 def admin_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("📋 Дневной отчёт (подробный)", callback_data="admin|daily_full"))
+    kb.add(InlineKeyboardButton("🆕 Создать таблицу (сохранить)", callback_data="admin|new_report"))
+    kb.add(InlineKeyboardButton("🗑️ Удалить отчёты", callback_data="admin|delete_reports"))
     kb.add(InlineKeyboardButton("📤 Выслать таблицу сейчас", callback_data="admin|send_daily_now"))
     kb.add(InlineKeyboardButton("👤 Выгрузить ученика (Excel + фото ZIP)", callback_data="admin|export_user"))
     kb.add(InlineKeyboardButton("🗑️ Удалить отправления ученика", callback_data="admin|delete_user"))
@@ -277,7 +294,42 @@ def get_praise(user_id: int, section: str, topic_title: str, content_type: str) 
     return " ".join(messages[:n])
 
 #MAKING EXCEL
+
+# ---------------- Excel styling and enhanced report helpers ----------------
+def style_worksheet(ws):
+    header_fill = PatternFill(start_color="A7F3D0", end_color="A7F3D0", fill_type="solid")
+    thin = Side(border_style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # header row styling
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = Font(bold=True)
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # apply border to body and compute column widths
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.border = border
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # auto width
+    for i, col in enumerate(ws.columns, 1):
+        max_length = 0
+        col_letter = get_column_letter(i)
+        for cell in col:
+            try:
+                if cell.value is not None:
+                    length = len(str(cell.value))
+                    if length > max_length:
+                        max_length = length
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_length + 5, 60)
+
 def submissions_for_date(target_date: date) -> List[dict]:
+    """Build summary rows including a task_flag (topic_id) and a mention link fallback."""
     dstr = target_date.isoformat()
     try:
         cursor.execute('SELECT id, username, first_name FROM users ORDER BY id')
@@ -285,41 +337,50 @@ def submissions_for_date(target_date: date) -> List[dict]:
         result = []
         for u in users:
             uid, uname, fname = u
-            username = uname or fname or ""
+            display_name = uname or fname or ""
+            # compute types submitted
             cursor.execute('SELECT type FROM submissions WHERE user_id = ? AND date = ?', (uid, dstr))
             types = {r[0] for r in cursor.fetchall()}
             dz = 'dz' in types
             cons = 'conspect' in types
+            # miss reason
             cursor.execute('SELECT reason FROM miss_reasons WHERE user_id = ? AND date = ?', (uid, dstr))
             rr = cursor.fetchone()
             reason = rr[0] if rr else ""
+            # last submission topic (task flag) for that day
+            cursor.execute('SELECT topic_id, topic_title FROM submissions WHERE user_id = ? AND date = ? ORDER BY ts DESC LIMIT 1', (uid, dstr))
+            trow = cursor.fetchone()
+            task_flag = trow[0] if trow and trow[0] else (trow[1] if trow and trow[1] else "")
             result.append({
                 "user_id": uid,
-                "username": username,
+                "username": display_name,
                 "date": dstr,
                 "dz_submitted": int(dz),
                 "conspect_submitted": int(cons),
-                "miss_reason": reason
+                "miss_reason": reason,
+                "task_flag": task_flag
             })
         return result
     except Exception:
         logger.exception("submissions_for_date build error")
         return []
 
+
 def make_daily_excel(target_date: date) -> io.BytesIO:
     rows = submissions_for_date(target_date)
     df_summary = pd.DataFrame(rows)
     try:
-        cursor.execute('''
-            SELECT s.user_id, u.username, u.first_name, s.type, s.section, s.topic_id, s.topic_title, s.content_type, s.content_summary, s.photo_file_id, s.date, s.ts
-            FROM submissions s JOIN users u ON s.user_id = u.id
-            WHERE s.date = ?
-            ORDER BY s.ts
-        ''', (target_date.isoformat(),))
+        cursor.execute(
+            "SELECT s.user_id, u.username, u.first_name, s.type, s.section, s.topic_id, s.topic_title, s.content_type, s.content_summary, s.photo_file_id, s.date, s.ts "
+            "FROM submissions s JOIN users u ON s.user_id = u.id "
+            "WHERE s.date = ? "
+            "ORDER BY s.ts",
+            (target_date.isoformat(),)
+        )
         raw = cursor.fetchall()
         raw_rows = [{
             "user_id": r[0],
-            "username": r[1] or r[2],
+            "username": r[1] or r[2] or "",
             "type": r[3],
             "section": r[4],
             "topic_id": r[5],
@@ -335,16 +396,118 @@ def make_daily_excel(target_date: date) -> io.BytesIO:
         logger.exception("make_daily_excel raw fetch error")
         df_raw = pd.DataFrame(columns=["user_id","username","type","section","topic_id","topic_title","content_type","content_summary","photo_file_id","date","ts"])
 
+    # ensure task_flag exists in summary (comes from submissions_for_date)
+    if "task_flag" not in df_summary.columns:
+        df_summary["task_flag"] = ""
+
+    # ensure task_flag in raw (from topic_id)
+    if "task_flag" not in df_raw.columns:
+        df_raw["task_flag"] = df_raw.get("topic_id", "")
+
+    # write initial excel to BytesIO
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        if df_summary.empty:
-            df_summary = pd.DataFrame(columns=["user_id","username","date","dz_submitted","conspect_submitted","miss_reason"])
         df_summary.to_excel(writer, sheet_name="daily_summary", index=False)
-        if df_raw.empty:
-            df_raw = pd.DataFrame(columns=["user_id","username","type","section","topic_id","topic_title","content_type","content_summary","photo_file_id","date","ts"])
         df_raw.to_excel(writer, sheet_name="raw_submissions", index=False)
     bio.seek(0)
-    return bio
+
+    # post-process with openpyxl to create hyperlinks and style
+    wb = load_workbook(filename=io.BytesIO(bio.read()))
+    # helper to make display name
+    def _display_name(username, first_name, uid):
+        if username and str(username).strip():
+            return f"@{username}"
+        if first_name and str(first_name).strip():
+            return first_name
+        return f"user_{uid}"
+
+    # process daily_summary sheet
+    if "daily_summary" in wb.sheetnames:
+        ws = wb["daily_summary"]
+        # map headers
+        headers = {cell.value: idx+1 for idx, cell in enumerate(ws[1])}
+        uid_col = headers.get("user_id")
+        uname_col = headers.get("username")
+        task_col = headers.get("task_flag")
+        if uid_col and uname_col:
+            for row in range(2, ws.max_row+1):
+                uid_cell = ws.cell(row=row, column=uid_col)
+                uname_cell = ws.cell(row=row, column=uname_col)
+                try:
+                    uid_val = int(uid_cell.value)
+                except Exception:
+                    uid_val = None
+                if uid_val:
+                    try:
+                        cursor.execute('SELECT username, first_name FROM users WHERE id = ?', (int(uid_val),))
+                        r = cursor.fetchone()
+                        uname_db = r[0] if r else None
+                        fname_db = r[1] if r else None
+                    except Exception:
+                        uname_db = None
+                        fname_db = None
+                    final_display = _display_name(uname_db, fname_db, uid_val)
+                    uname_cell.value = final_display
+                    uname_cell.hyperlink = f"tg://user?id={uid_val}"
+                    uname_cell.style = "Hyperlink"
+        style_worksheet(ws)
+
+    # process raw_submissions sheet
+    if "raw_submissions" in wb.sheetnames:
+        ws2 = wb["raw_submissions"]
+        headers2 = {cell.value: idx+1 for idx, cell in enumerate(ws2[1])}
+        uid_col2 = headers2.get("user_id")
+        uname_col2 = headers2.get("username")
+        topic_id_col = headers2.get("topic_id")
+        task_col2 = headers2.get("task_flag")
+        if uid_col2 and uname_col2:
+            for row in range(2, ws2.max_row+1):
+                uid_cell = ws2.cell(row=row, column=uid_col2)
+                uname_cell = ws2.cell(row=row, column=uname_col2)
+                try:
+                    uid_val = int(uid_cell.value)
+                except Exception:
+                    uid_val = None
+                if uid_val:
+                    try:
+                        cursor.execute('SELECT username, first_name FROM users WHERE id = ?', (int(uid_val),))
+                        r = cursor.fetchone()
+                        uname_db = r[0] if r else None
+                        fname_db = r[1] if r else None
+                    except Exception:
+                        uname_db = None
+                        fname_db = None
+                    final_display = _display_name(uname_db, fname_db, uid_val)
+                    uname_cell.value = final_display
+                    uname_cell.hyperlink = f"tg://user?id={uid_val}"
+                    uname_cell.style = "Hyperlink"
+        # ensure task_flag column exists and filled from topic_id
+        if topic_id_col:
+            if not task_col2:
+                task_col_idx = ws2.max_column + 1
+                ws2.cell(row=1, column=task_col_idx, value="task_flag")
+            else:
+                task_col_idx = task_col2
+            for row in range(2, ws2.max_row+1):
+                topic_cell = ws2.cell(row=row, column=topic_id_col)
+                val = topic_cell.value or ""
+                ws2.cell(row=row, column=task_col_idx, value=val)
+        style_worksheet(ws2)
+
+    # save workbook to BytesIO and also save a copy on disk
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+
+    # save on disk
+    fname = f"daily_report_{target_date.isoformat()}_{int(time.time())}.xlsx"
+    fpath = os.path.join(REPORTS_DIR, fname)
+    with open(fpath, "wb") as f:
+        f.write(out.getbuffer())
+    logger.info(f"Saved report to {fpath}")
+
+    out.seek(0)
+    return out
 
 async def send_daily_excel_to_admin(target_date: date):
     try:
@@ -492,7 +655,7 @@ async def handle_text(message: types.Message):
         praise = get_praise(message.from_user.id, sub["section"], sub["topic_title"], "text")
         await message.answer(praise, reply_markup=make_main_kb(message.from_user.id==ADMIN_ID))
         try:
-            await bot.send_message(ADMIN_ID, f"✅ @{message.from_user.username or message.from_user.first_name} прислал {sub['type'].upper()}: {sub['section']} — {sub['topic_title']}\n{sub['content_summary']}")
+            await bot.send_message(ADMIN_ID, f"✅ {mention_html(message.from_user)} прислал {sub['type'].upper()}: {sub['section']} — {sub['topic_title']}\n{sub['content_summary']}")
         except Exception:
             pass
         return
@@ -513,7 +676,7 @@ async def handle_text(message: types.Message):
         praise = get_praise(message.from_user.id, sub["section"], sub["topic_title"], "text")
         await message.answer("Записал без выбора темы. В следующий раз выбери тему через меню.\n\n" + praise, reply_markup=make_main_kb(message.from_user.id==ADMIN_ID))
         try:
-            await bot.send_message(ADMIN_ID, f"✅ @{message.from_user.username or message.from_user.first_name} прислал {sub['type'].upper()} (без темы): {sub['content_summary']}")
+            await bot.send_message(ADMIN_ID, f"✅ {mention_html(message.from_user)} прислал {sub['type'].upper()} (без темы): {sub['content_summary']}")
         except Exception:
             pass
         return
@@ -557,7 +720,7 @@ async def handle_photo(message: types.Message):
         praise = get_praise(message.from_user.id, sub["section"], sub["topic_title"], "photo")
         await message.answer(praise, reply_markup=make_main_kb(message.from_user.id==ADMIN_ID))
         try:
-            await bot.send_message(ADMIN_ID, f"📸 @{message.from_user.username or message.from_user.first_name} прислал {sub['type'].upper()}: {sub['section']} — {sub['topic_title']} — {summary}")
+            await bot.send_message(ADMIN_ID, f"📸 {mention_html(message.from_user)} прислал {sub['type'].upper()}: {sub['section']} — {sub['topic_title']} — {summary}")
             await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
         except Exception:
             pass
@@ -627,7 +790,7 @@ async def process_media_groups():
                 except Exception:
                     pass
                 try:
-                    await bot.send_message(ADMIN_ID, f"📸 user {uid} прислал {sub['type'].upper()} (альбом): {sub['section']} — {sub['topic_title']}")
+                    await bot.send_message(ADMIN_ID, f"📸 {mention_html(fake_user)} прислал {sub['type'].upper()} (альбом): {sub['section']} — {sub['topic_title']}")
                 except Exception:
                     pass
             except Exception:
@@ -762,6 +925,31 @@ async def cb_admin(call: types.CallbackQuery):
         await call.answer("Отправил таблицу прямо сейчас.")
         return
 
+    if action == "new_report":
+        bio = make_daily_excel(date.today())
+        fname = f"daily_report_{date.today().isoformat()}_{int(time.time())}.xlsx"
+        await bot.send_document(call.from_user.id, InputFile(bio, filename=fname))
+        await call.answer("Создан и отправлен отчёт (сохранён в reports).")
+        return
+
+    if action == "delete_reports":
+        # delete all files in REPORTS_DIR
+        try:
+            files = os.listdir(REPORTS_DIR)
+            deleted = 0
+            for f in files:
+                p = os.path.join(REPORTS_DIR, f)
+                try:
+                    os.remove(p)
+                    deleted += 1
+                except Exception:
+                    pass
+            await bot.send_message(call.from_user.id, f"Удалено {deleted} файлов из папки reports.")
+        except Exception:
+            await bot.send_message(call.from_user.id, "Ошибка при удалении отчётов.")
+        await call.answer()
+        return
+
     if action == "export_user":
         admin_pending[aid] = {"action": "export_user"}
         await bot.send_message(call.from_user.id, "Введи ID или username ученика для выгрузки (можно с @):")
@@ -870,7 +1058,6 @@ async def on_startup(dispatcher):
 if __name__ == "__main__":
     print("Starting bot. Make sure API_TOKEN and ADMIN_ID are set in env.")
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
-
 
 
 
