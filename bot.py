@@ -14,20 +14,24 @@ Features:
 import random
 import os
 import io
-import json
 import time
 import zipfile
 import logging
 import shutil
 import sqlite3
-import asyncio
 import unicodedata
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
 import pandas as pd
+
+# Additional imports for charts and PNG generation
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend for servers
+import matplotlib.pyplot as plt
+from io import BytesIO as _BytesIO
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -125,6 +129,7 @@ def init_db():
         content_type TEXT,
         content_summary TEXT,
         photo_file_id TEXT,
+        message_id INTEGER,
         date TEXT,
         ts TEXT,
         FOREIGN KEY (user_id) REFERENCES users(id)
@@ -177,11 +182,11 @@ def ensure_user_record_by_id(uid: int, username: str = "", first_name: str = "")
     except Exception:
         logger.exception("ensure_user_record_by_id error")
 
-def add_submission_obj(user: types.User, submission: dict):
+def add_submission_obj(user: types.User, submission: dict, message_id: int = None):
     ensure_user_record_obj(user)
     try:
         cursor.execute('''
-            INSERT INTO submissions (user_id, type, section, topic_id, topic_title, content_type, content_summary, photo_file_id, date, ts)
+            INSERT INTO submissions (user_id, type, section, topic_id, topic_title, content_type, content_summary, photo_file_id, message_id, date, ts)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (user.id, submission['type'], submission['section'], submission['topic_id'], submission['topic_title'],
               submission['content_type'], submission.get('content_summary', ''), submission.get('photo_file_id', ''),
@@ -253,6 +258,7 @@ def topics_keyboard(section_name):
     topics = SECTIONS.get(section_name, [])
     for t in topics:
         kb.add(InlineKeyboardButton(t["title"], callback_data=f"topic|{section_name}|{t['id']}"))
+    kb.add(InlineKeyboardButton("📊 Исторический отчёт (ALL)", callback_data="admin|full_history_manual"))
     kb.add(InlineKeyboardButton("Отмена", callback_data="cancel"))
     return kb
 
@@ -265,6 +271,7 @@ def admin_kb():
     kb.add(InlineKeyboardButton("👤 Выгрузить ученика (Excel + фото ZIP)", callback_data="admin|export_user"))
     kb.add(InlineKeyboardButton("🗑️ Удалить отправления ученика", callback_data="admin|delete_user"))
     kb.add(InlineKeyboardButton("♻️ Сбросить все статусы", callback_data="admin|reset_all"))
+    kb.add(InlineKeyboardButton("📊 Исторический отчёт (ALL)", callback_data="admin|full_history_manual"))
     kb.add(InlineKeyboardButton("Отмена", callback_data="cancel"))
     return kb
 
@@ -348,9 +355,10 @@ def submissions_for_date(target_date: date) -> List[dict]:
             rr = cursor.fetchone()
             reason = rr[0] if rr else ""
             # last submission topic (task flag) for that day
-            cursor.execute('SELECT topic_id, topic_title FROM submissions WHERE user_id = ? AND date = ? ORDER BY ts DESC LIMIT 1', (uid, dstr))
+            cursor.execute('SELECT topic_id, topic_title, message_id FROM submissions WHERE user_id = ? AND date = ? ORDER BY ts DESC LIMIT 1', (uid, dstr))
             trow = cursor.fetchone()
             task_flag = trow[0] if trow and trow[0] else (trow[1] if trow and trow[1] else "")
+            message_id = trow[2] if trow and len(trow) > 2 and trow[2] else None
             result.append({
                 "user_id": uid,
                 "username": display_name,
@@ -358,7 +366,8 @@ def submissions_for_date(target_date: date) -> List[dict]:
                 "dz_submitted": int(dz),
                 "conspect_submitted": int(cons),
                 "miss_reason": reason,
-                "task_flag": task_flag
+                "task_flag": task_flag,
+                "message_id": message_id
             })
         return result
     except Exception:
@@ -646,7 +655,7 @@ async def handle_text(message: types.Message):
         sub = {"type": p["type"], "section": p["section"], "topic_id": p["topic"]["id"], "topic_title": p["topic"]["title"],
                "content_type": "text", "content_summary": (text if len(text)<=300 else text[:297]+"..."),
                "date": today_str(), "ts": datetime.utcnow().isoformat()}
-        add_submission_obj(message.from_user, sub)
+        add_submission_obj(message.from_user, sub, message.message_id)
         if sub["type"] == "conspect":
             try:
                 save_conspect_text(uid, sub["section"].replace("/","_"), sub["topic_id"], text)
@@ -667,7 +676,7 @@ async def handle_text(message: types.Message):
         sub = {"type": kind, "section": "Без раздела", "topic_id": "none", "topic_title": text.split("\n",1)[0][:50],
                "content_type": "text", "content_summary": (text if len(text)<=300 else text[:297]+"..."),
                "date": today_str(), "ts": datetime.utcnow().isoformat()}
-        add_submission_obj(message.from_user, sub)
+        add_submission_obj(message.from_user, sub, message.message_id)
         if kind == "conspect":
             try:
                 save_conspect_text(uid, "Без_раздела", "none", text)
@@ -709,7 +718,7 @@ async def handle_photo(message: types.Message):
         summary = (caption[:200] + "...") if len(caption)>200 else caption or "Фото"
         sub = {"type": p["type"], "section": p["section"], "topic_id": p["topic"]["id"], "topic_title": p["topic"]["title"],
                "content_type": "photo", "content_summary": summary, "photo_file_id": file_id, "date": today_str(), "ts": datetime.utcnow().isoformat()}
-        add_submission_obj(message.from_user, sub)
+        add_submission_obj(message.from_user, sub, message.message_id)
         if sub["type"] == "conspect":
             try:
                 fbytes = await download_file_bytes(file_id)
@@ -733,7 +742,7 @@ async def handle_photo(message: types.Message):
         summary = (caption[:200] + "...") if len(caption)>200 else caption
         sub = {"type": kind, "section": "Без раздела", "topic_id": "none", "topic_title": summary.split("\n",1)[0][:50],
                "content_type": "photo", "content_summary": summary, "photo_file_id": file_id, "date": today_str(), "ts": datetime.utcnow().isoformat()}
-        add_submission_obj(message.from_user, sub)
+        add_submission_obj(message.from_user, sub, message.message_id)
         if kind == "conspect":
             try:
                 fbytes = await download_file_bytes(file_id)
@@ -773,7 +782,7 @@ async def process_media_groups():
                        "date": today_str(), "ts": datetime.utcnow().isoformat()}
                 ensure_user_record_by_id(int(uid))
                 fake_user = types.User(id=int(uid), is_bot=False, first_name="", username="")
-                add_submission_obj(fake_user, sub)
+                add_submission_obj(fake_user, sub, None)
                 # save files if conspect
                 if sub['type'] == 'conspect':
                     files = []
@@ -932,6 +941,22 @@ async def cb_admin(call: types.CallbackQuery):
         await call.answer("Создан и отправлен отчёт (сохранён в reports).")
         return
 
+
+    if action == "full_history_manual":
+        # run update and send PNGs + excel immediately
+        cursor.execute('SELECT DISTINCT date FROM submissions ORDER BY date')
+        dates = [parse_date(r[0]) for r in cursor.fetchall() if parse_date(r[0])]
+        if not dates:
+            await bot.send_message(call.from_user.id, "Нет данных для исторического отчёта.")
+            await call.answer()
+            return
+        for d in dates:
+            update_full_history_excel(d)
+        # create charts inside excel and PNGs & send
+        await update_full_history_daily()
+        await call.answer("Исторический отчёт и графики отправлены.")
+        return
+
     if action == "delete_reports":
         # delete all files in REPORTS_DIR
         try:
@@ -1046,11 +1071,305 @@ async def daily_admin_report():
     except Exception:
         logger.exception("daily_admin_report error")
 
+
+# ---------------- FULL HISTORY, CHARTS AND TOPS ----------------
+def update_full_history_excel(target_date: date):
+    """
+    Append one row per user for target_date into single sheet "ALL".
+    Ensures clickable HYPERLINK formulas to tg://user?id=..., fills task_flag,
+    skips rows with dz==0 and conspect==0 and empty reason, and avoids duplicates.
+    """
+    path = os.path.join(REPORTS_DIR, "full_history.xlsx")
+    # ensure file exists with sheet ALL
+    if not os.path.exists(path):
+        # create with header
+        from openpyxl import Workbook
+        wb_new = Workbook()
+        ws_new = wb_new.active
+        ws_new.title = "ALL"
+        headers = ["name", "tag", "date", "dz", "conspect", "miss_reason", "task_flag", "MessageLink"]
+        for i, h in enumerate(headers, start=1):
+            ws_new.cell(row=1, column=i, value=h)
+        wb_new.save(path)
+
+    wb = load_workbook(path)
+    if "ALL" not in wb.sheetnames:
+        wb.create_sheet("ALL")
+    ws = wb["ALL"]
+
+    # build set of existing (user_id, date) to avoid duplicates
+    existing = set()
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        try:
+            uid = row[0]
+            d = row[2]
+            existing.add((str(uid), str(d)))
+        except Exception:
+            pass
+
+    dstr = target_date.isoformat()
+
+    # iterate users from DB and compute statuses
+    try:
+        cursor.execute('SELECT id, username, first_name FROM users ORDER BY id')
+        users = cursor.fetchall()
+    except Exception:
+        users = []
+
+    rows_to_append = []
+    for u in users:
+        uid, uname, fname = u
+        uid_s = str(uid)
+        # skip if already present for that date
+        if (uid_s, dstr) in existing:
+            continue
+        # compute dz and cons presence
+        try:
+            cursor.execute('SELECT COUNT(*) FROM submissions WHERE user_id = ? AND date = ? AND type = ?', (uid, dstr, 'dz'))
+            dz = cursor.fetchone()[0] or 0
+            cursor.execute('SELECT COUNT(*) FROM submissions WHERE user_id = ? AND date = ? AND type = ?', (uid, dstr, 'conspect'))
+            cons = cursor.fetchone()[0] or 0
+            cursor.execute('SELECT reason FROM miss_reasons WHERE user_id = ? AND date = ?', (uid, dstr))
+            rr = cursor.fetchone()
+            reason = rr[0] if rr and rr[0] else ""
+            # task_flag: last submission topic_id or topic_title
+            cursor.execute('SELECT topic_id, topic_title FROM submissions WHERE user_id = ? AND date = ? ORDER BY ts DESC LIMIT 1', (uid, dstr))
+            trow = cursor.fetchone()
+            task_flag = ""
+            if trow:
+                task_flag = trow[0] or trow[1] or ""
+        except Exception:
+            dz = 0; cons = 0; reason = ""; task_flag = ""
+
+        # skip empty rows: dz==0 and cons==0 and no reason
+        if (int(dz) == 0) and (int(cons) == 0) and (not str(reason).strip()):
+            continue
+
+        # build name and tag
+        # name: first_name or user_123
+        if fname and str(fname).strip():
+            name_value = str(fname)
+        else:
+            name_value = f"user_{uid}"
+
+        # tag: @username if exists else ""
+        if uname and str(uname).strip():
+            tag_value = f"@{uname}"
+        else:
+            tag_value = ""
+
+        # message link
+        try:
+            cursor.execute('SELECT message_id FROM submissions WHERE user_id = ? AND date = ? ORDER BY ts DESC LIMIT 1', (uid, dstr))
+            mid_row = cursor.fetchone()
+            mid = mid_row[0] if mid_row and mid_row[0] else None
+        except Exception:
+            mid = None
+
+        if mid:
+            msg_link = f'=HYPERLINK("tg://openmessage?chat_id={uid}&message_id={mid}", "Open")'
+        else:
+            msg_link = ""
+
+        rows_to_append.append((name_value, tag_value, dstr, int(dz), int(cons), reason or "", task_flag or "", msg_link))
+
+    # append rows to sheet
+    for r in rows_to_append:
+        next_row = ws.max_row + 1
+        for ci, val in enumerate(r, start=1):
+            ws.cell(row=next_row, column=ci, value=val)
+        # mark username cell style as Hyperlink for Excel
+        try:
+            ws.cell(row=next_row, column=2).style = "Hyperlink"
+        except Exception:
+            pass
+
+    # style worksheet and autosize
+    try:
+        style_worksheet(ws)
+        ws.freeze_panes = ws['A2']
+    except Exception:
+        pass
+
+    wb.save(path)
+
+def generate_miss_graph_by_student_png() -> _BytesIO:
+    """Generate PNG showing number of misses per student (overall) and return BytesIO."""
+    # count misses from miss_reasons table and also infer misses by days without submissions
+    try:
+        # Number of days tracked
+        cursor.execute('SELECT COUNT(DISTINCT date) FROM submissions')
+        days_row = cursor.fetchone()
+        total_days = days_row[0] if days_row and days_row[0] else 0
+
+        # Count misses recorded in miss_reasons
+        cursor.execute('SELECT user_id, COUNT(*) as cnt FROM miss_reasons GROUP BY user_id ORDER BY cnt DESC')
+        rows = cursor.fetchall()
+        users = []
+        counts = []
+        for uid, cnt in rows:
+            cursor.execute('SELECT username, first_name FROM users WHERE id = ?', (uid,))
+            r = cursor.fetchone()
+            name = (('@'+r[0]) if r and r[0] else (r[1] if r and r[1] else f'user_{uid}'))
+            users.append(name)
+            counts.append(cnt)
+
+        # If no explicit miss_reasons, try infer by checking days without submissions per user
+        if not rows:
+            cursor.execute('SELECT id, username, first_name FROM users')
+            all_users = cursor.fetchall()
+            for u in all_users:
+                uid, uname, fname = u
+                cursor.execute('SELECT COUNT(DISTINCT date) FROM submissions WHERE user_id = ?', (uid,))
+                sub_days = cursor.fetchone()[0] or 0
+                misses = max(0, total_days - sub_days) if total_days>0 else 0
+                users.append(('@'+uname) if uname else (fname or f'user_{uid}'))
+                counts.append(misses)
+
+        # plot bar chart
+        fig, ax = plt.subplots(figsize=(8, max(4, len(users)*0.4)))
+        ax.bar(range(len(users)), counts)
+        ax.set_xticks(range(len(users)))
+        ax.set_xticklabels(users, rotation=45, ha='right')
+        ax.set_ylabel('Пропуски (кол-во дней)')
+        ax.set_title('Пропуски по ученикам (всего)')
+        plt.tight_layout()
+
+        bio = _BytesIO()
+        fig.savefig(bio, format='png', bbox_inches='tight')
+        plt.close(fig)
+        bio.seek(0)
+        return bio
+    except Exception:
+        logger.exception("generate_miss_graph_by_student_png error")
+        return _BytesIO()
+
+
+def generate_top_students_png(kind: str = "dz", top_n: int = 10) -> _BytesIO:
+    """Generate PNG of top students by submissions of `kind` ('dz' or 'conspect')."""
+    try:
+        cursor.execute('SELECT user_id, COUNT(*) as cnt FROM submissions WHERE type = ? GROUP BY user_id ORDER BY cnt DESC LIMIT ?', (kind, top_n))
+        rows = cursor.fetchall()
+        users = []
+        counts = []
+        for uid, cnt in rows:
+            cursor.execute('SELECT username, first_name FROM users WHERE id = ?', (uid,))
+            r = cursor.fetchone()
+            name = (('@'+r[0]) if r and r[0] else (r[1] if r and r[1] else f'user_{uid}'))
+            users.append(name)
+            counts.append(cnt)
+
+        if not rows:
+            bio = _BytesIO()
+            fig, ax = plt.subplots(figsize=(6,3))
+            ax.text(0.5, 0.5, 'Нет данных', ha='center', va='center')
+            plt.axis('off')
+            fig.savefig(bio, format='png', bbox_inches='tight')
+            plt.close(fig)
+            bio.seek(0)
+            return bio
+
+        fig, ax = plt.subplots(figsize=(8, max(3, len(users)*0.4)))
+        ax.bar(range(len(users)), counts)
+        ax.set_xticks(range(len(users)))
+        ax.set_xticklabels(users, rotation=45, ha='right')
+        ax.set_ylabel('Кол-во отправлений')
+        ax.set_title('Топ учеников по ' + ('ДЗ' if kind=='dz' else 'конспектам'))
+        plt.tight_layout()
+
+        bio = _BytesIO()
+        fig.savefig(bio, format='png', bbox_inches='tight')
+        plt.close(fig)
+        bio.seek(0)
+        return bio
+    except Exception:
+        logger.exception("generate_top_students_png error")
+        return _BytesIO()
+
+
+async def update_full_history_daily():
+    """Regenerate full_history.xlsx (sheets for each date), charts and PNGs, and send to ADMIN."""
+    try:
+        cursor.execute('SELECT DISTINCT date FROM submissions ORDER BY date')
+        dates = [parse_date(r[0]) for r in cursor.fetchall() if parse_date(r[0])]
+        if not dates:
+            return
+
+        for d in dates:
+            update_full_history_excel(d)
+
+        # create charts inside excel: summary sheets for DZ & conspects
+        path = os.path.join(REPORTS_DIR, "full_history.xlsx")
+        wb = load_workbook(path)
+
+        # remove old summary sheets if present
+        for name in ("Chart_DZ", "Chart_Conspects"):
+            if name in wb.sheetnames:
+                wb.remove(wb[name])
+
+        # DZ summary
+        cursor.execute("SELECT date, COUNT(*) FROM submissions WHERE type='dz' GROUP BY date ORDER BY date")
+        dz_rows = cursor.fetchall()
+        ws1 = wb.create_sheet("Chart_DZ")
+        ws1.append(["date", "dz_count"])
+        for r in dz_rows:
+            ws1.append([r[0], r[1]])
+
+        # Conspects summary
+        cursor.execute("SELECT date, COUNT(*) FROM submissions WHERE type='conspect' GROUP BY date ORDER BY date")
+        c_rows = cursor.fetchall()
+        ws2 = wb.create_sheet("Chart_Conspects")
+        ws2.append(["date", "cons_count"])
+        for r in c_rows:
+            ws2.append([r[0], r[1]])
+
+        wb.save(path)
+
+        # generate PNGs
+        miss_png = generate_miss_graph_by_student_png()
+        top_dz_png = generate_top_students_png('dz')
+        top_cons_png = generate_top_students_png('conspect')
+
+        # send to admin: three PNGs as documents
+        try:
+            await bot.send_photo(ADMIN_ID, photo=InputFile(miss_png, filename='misses_by_student.png'))
+        except Exception:
+            try:
+                await bot.send_document(ADMIN_ID, InputFile(miss_png, filename='misses_by_student.png'))
+            except Exception:
+                pass
+        try:
+            await bot.send_photo(ADMIN_ID, photo=InputFile(top_dz_png, filename='top_dz.png'))
+        except Exception:
+            try:
+                await bot.send_document(ADMIN_ID, InputFile(top_dz_png, filename='top_dz.png'))
+            except Exception:
+                pass
+        try:
+            await bot.send_photo(ADMIN_ID, photo=InputFile(top_cons_png, filename='top_cons.png'))
+        except Exception:
+            try:
+                await bot.send_document(ADMIN_ID, InputFile(top_cons_png, filename='top_cons.png'))
+            except Exception:
+                pass
+
+        # finally send the excel file
+        try:
+            await bot.send_document(ADMIN_ID, InputFile(path, filename='full_history.xlsx'))
+        except Exception:
+            pass
+
+    except Exception:
+        logger.exception("update_full_history_daily error")
+
+
 async def on_startup(dispatcher):
     scheduler.add_job(daily_reminder, "cron", hour=18, minute=0)
     scheduler.add_job(daily_admin_report, "cron", hour=23, minute=55)
     scheduler.add_job(process_media_groups, "interval", seconds=2)
     scheduler.add_job(ask_missed_reason, "cron", hour=23, minute=57)
+    # schedule full history daily update at 23:50
+    scheduler.add_job(update_full_history_daily, 'cron', hour=23, minute=50)
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -1058,6 +1377,36 @@ async def on_startup(dispatcher):
 if __name__ == "__main__":
     print("Starting bot. Make sure API_TOKEN and ADMIN_ID are set in env.")
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+
+
+
+# === AUTO-ADDED ADMIN PANEL WITH FULL REPORT BUTTON ===
+
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+@dp.message_handler(commands=['admin'])
+async def admin_panel(message: types.Message):
+    # Only allow the bot owner
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Нет доступа")
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📊 Общий отчёт", callback_data="generate_full_history"))
+    await message.answer("Админ-панель:", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data == "generate_full_history")
+async def process_full_report(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer("Нет доступа", show_alert=True)
+
+    await call.answer("Генерирую отчёт...")
+
+    path = update_full_history_excel()
+    if path and os.path.exists(path):
+        with open(path, "rb") as f:
+            await call.message.answer_document(f, caption="Готово!")
+    else:
+        await call.message.answer("Ошибка: не удалось создать отчёт.")
+
 
 
 
